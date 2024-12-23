@@ -313,11 +313,11 @@ impl<PIO: Instance + UartPioAccess> Handler<PIO::Interrupt> for UartInterruptHan
                     writer.push_done(n);
                     PIO::Interrupt::unpend();
                     PIO::uart_buffer().waker_rx.wake();
-                } else if irq & (1 << 0) == 1 {
-                    // RX_SM Invalid Stop Bit Raised IRQ 0
-                    pio.irq().write(|f| f.set_irq(1 << 0));
-                    PIO::Interrupt::unpend();
                 }
+            } else if irq & (1 << 0) == 1 {
+                // RX_SM Invalid Stop Bit Raised IRQ 0
+                pio.irq().write(|f| f.set_irq(1 << 0));
+                PIO::Interrupt::unpend();
             }
         }
     }
