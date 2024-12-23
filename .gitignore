@@ -1,1 +1,4 @@
 .vscode/RP2040.svd
+target/
+rmk-*.hex
+rmk-*.uf2
