@@ -125,10 +125,14 @@ impl<'a, PIO: Instance + UartPioAccess> HalfDuplexUart<'a, PIO> {
     }
 
     fn setup_pin(&mut self) {
+        rp_pac::IO_BANK0
+            .gpio(self.pin.pin() as _)
+            .ctrl()
+            .modify(|f| f.set_oeover(Oeover::INVERT));
         self.pin.set_schmitt(true);
         self.pin.set_pull(Pull::Up);
         self.pin.set_slew_rate(SlewRate::Fast);
-        self.pin.set_drive_strength(Drive::_2mA);
+        self.pin.set_drive_strength(Drive::_12mA);
     }
 
     fn setup_sm_tx(&mut self) {
@@ -181,20 +185,13 @@ impl<'a, PIO: Instance + UartPioAccess> HalfDuplexUart<'a, PIO> {
         cfg.fifo_join = FifoJoin::RxOnly;
         self.sm_rx.set_config(&cfg);
 
-        self.sm_rx.set_pin_dirs(Direction::In, &[&self.pin]);
+        // OEOVER set to INVERT, Direction::Out inverted to Direction:In
+        self.sm_rx.set_pin_dirs(Direction::Out, &[&self.pin]);
         self.sm_tx.set_pins(Level::Low, &[&self.pin]);
     }
 
     fn enable_sm_tx(&mut self) {
         self.sm_rx.set_enable(false);
-        self.sm_rx.set_pins(Level::High, &[&self.pin]);
-        rp_pac::IO_BANK0
-            .gpio(self.pin.pin() as _)
-            .ctrl()
-            .modify(|f| f.set_oeover(Oeover::INVERT));
-        self.sm_rx.set_pin_dirs(Direction::Out, &[&self.pin]);
-        self.sm_tx.set_pins(Level::Low, &[&self.pin]);
-        self.pin.set_drive_strength(Drive::_12mA);
         self.sm_tx.restart();
         self.sm_tx.set_enable(true);
     }
@@ -205,14 +202,6 @@ impl<'a, PIO: Instance + UartPioAccess> HalfDuplexUart<'a, PIO> {
             ((1_000_000u32 * 11) / BAUD_RATE) as u64,
         ));
         self.sm_tx.set_enable(false);
-        self.pin.set_drive_strength(Drive::_2mA);
-        self.sm_rx.set_pins(Level::High, &[&self.pin]);
-        rp_pac::IO_BANK0
-            .gpio(self.pin.pin() as _)
-            .ctrl()
-            .modify(|f| f.set_oeover(Oeover::NORMAL));
-        self.sm_rx.set_pin_dirs(Direction::In, &[&self.pin]);
-        self.sm_tx.set_pins(Level::Low, &[&self.pin]);
         self.sm_rx.set_enable(true);
     }
 
