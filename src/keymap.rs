@@ -10,7 +10,7 @@ pub fn get_default_keymap() -> [[[KeyAction; COL]; ROW]; NUM_LAYER] {
         layer!([
             [k!(Escape), k!(Kc1), k!(Kc2), k!(Kc3), k!(Kc4), k!(Kc5)],
             [k!(Tab), k!(Quote), k!(Comma), k!(Dot), k!(P), k!(Y)],
-            [k!(CapsLock), k!(A), k!(O), k!(E), k!(I), k!(U)],
+            [k!(CapsLock), k!(A), k!(O), k!(E), k!(U), k!(I)],
             [k!(LShift), k!(Semicolon), k!(Q), k!(J), k!(K), k!(X)],
             [mo!(0), k!(LCtrl), k!(LAlt), k!(LGui), k!(Enter), k!(Y)],
             [k!(Backspace), k!(Kc0), k!(Kc9), k!(Kc8), k!(Kc7), k!(Kc6)],
