@@ -1,3 +1,4 @@
+use core::cell::RefCell;
 use core::future::{poll_fn, Future};
 use core::marker::PhantomData;
 use core::task::Poll;
@@ -17,8 +18,10 @@ use embassy_rp::{
     },
     uart::Error,
 };
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::waitqueue::AtomicWaker;
-use embassy_time::{block_for, Duration, Timer};
+use embassy_time::{Duration, Timer};
 use embedded_io_async::{ErrorType, Read, Write};
 use fixed::traits::ToFixed;
 use pio_proc;
@@ -33,10 +36,21 @@ unsafe impl Binding<PIO0_IRQ_0, InterruptHandler<PIO0>> for IrqBinding {}
 
 const BAUD_RATE: u32 = 115_200;
 
+const STATUS_SM1_RX_BIT: u32 = 1 << 1;
+const STATUS_SM0_TX_BIT: u32 = 1 << 4;
+const STATUS_SM_IRQ0_BIT: u32 = 1 << 8;
+const STATUS_SM_IRQ1_BIT: u32 = 1 << 9;
+const STATUS_SM_IRQ2_BIT: u32 = 1 << 10;
+const IRQ_FLAG_0: u8 = 1 << 0;
+const IRQ_FLAG_1: u8 = 1 << 1;
+const IRQ_FLAG_2: u8 = 1 << 2;
+
 pub struct UartBuffer {
     buf_tx: RingBuffer,
     buf_rx: RingBuffer,
     waker_rx: AtomicWaker,
+    waker_tx: AtomicWaker,
+    idle_line: Mutex<CriticalSectionRawMutex, RefCell<bool>>,
 }
 
 impl UartBuffer {
@@ -45,6 +59,8 @@ impl UartBuffer {
             buf_rx: RingBuffer::new(),
             buf_tx: RingBuffer::new(),
             waker_rx: AtomicWaker::new(),
+            waker_tx: AtomicWaker::new(),
+            idle_line: Mutex::new(RefCell::new(true)),
         }
     }
 }
@@ -101,9 +117,11 @@ impl<'a, PIO: Instance + UartPioAccess> HalfDuplexUart<'a, PIO> {
 
         PIO::Interrupt::disable();
         PIO::Interrupt::set_priority(Priority::P0);
-        PIO::regs().irqs(0).inte().write(|m| {
-            m.set_sm1(true);
-            m.set_sm1_rxnempty(true);
+        PIO::regs().irqs(0).inte().write(|i| {
+            i.set_sm0(true);
+            i.set_sm1(true);
+            i.set_sm2(true);
+            i.set_sm1_rxnempty(true);
         });
         PIO::Interrupt::unpend();
         unsafe { PIO::Interrupt::enable() };
@@ -119,7 +137,6 @@ impl<'a, PIO: Instance + UartPioAccess> HalfDuplexUart<'a, PIO> {
         uart.setup_pin();
         uart.setup_sm_tx();
         uart.setup_sm_rx();
-        uart.enable_sm_rx();
 
         uart
     }
@@ -137,7 +154,7 @@ impl<'a, PIO: Instance + UartPioAccess> HalfDuplexUart<'a, PIO> {
 
     fn setup_sm_tx(&mut self) {
         let prg = pio_proc::pio_asm!(
-            ".side_set 1 opt pindirs"
+            ".side_set 1 opt pindirs",
             ".wrap_target",
             "pull   block           side 1 [7]",
             "set    x, 7            side 0 [7]",
@@ -161,16 +178,29 @@ impl<'a, PIO: Instance + UartPioAccess> HalfDuplexUart<'a, PIO> {
     fn setup_sm_rx(&mut self) {
         let prg = pio_proc::pio_asm!(
             ".wrap_target",
-            "wait   0 pin, 0",
-            "set    x, 7                   [10]"
-            "in     pins, 1",
-            "jmp    x--, 2                 [6]",
-            "jmp    pin, 8",
-            "irq    wait 0",
-            "wait   1 pin, 0",
-            "jmp    0",
-            "push   block",
-            ".wrap",
+            "wait_idle:",
+            "    wait 0 pin, 0",
+            "    irq  1                         [2]",
+            "start:"
+            "    set  x, 7",
+            "    set  y, 10                     [6]",
+            "read_loop:",
+            "    in   pins, 1",
+            "    jmp  x-- read_loop             [6]",
+            "    jmp  pin good_stop",
+            "    irq  wait 0",
+            "    wait 1 pin, 0",
+            "    jmp  check_idle",
+            "good_stop:",
+            "    push block",
+            "check_idle:",
+            "    jmp  pin check_idle_continue",
+            "    jmp  start"
+            "check_idle_continue:"
+            "    jmp  y-- check_idle"
+            "    irq  2",
+            "    jmp  wait_idle",
+            ".wrap"
         );
 
         let mut cfg = Config::default();
@@ -188,24 +218,36 @@ impl<'a, PIO: Instance + UartPioAccess> HalfDuplexUart<'a, PIO> {
         // OEOVER set to INVERT, Direction::Out inverted to Direction:In
         self.sm_rx.set_pin_dirs(Direction::Out, &[&self.pin]);
         self.sm_tx.set_pins(Level::Low, &[&self.pin]);
+
+        self.sm_rx.set_enable(true);
     }
 
-    fn enable_sm_tx(&mut self) {
+    async fn enable_sm_tx(&mut self) {
+        while !PIO::uart_buffer().idle_line.lock(|b| *b.borrow()) {
+            Timer::after(Duration::from_micros(
+                ((1_000_000u32 * 1) / BAUD_RATE) as u64,
+            ))
+            .await;
+        }
         self.sm_rx.set_enable(false);
         self.sm_tx.restart();
         self.sm_tx.set_enable(true);
     }
 
-    fn enable_sm_rx(&mut self) {
+    async fn enable_sm_rx(&mut self) {
         while !self.sm_tx.tx().empty() {}
-        block_for(Duration::from_micros(
+        Timer::after(Duration::from_micros(
             ((1_000_000u32 * 11) / BAUD_RATE) as u64,
-        ));
+        ))
+        .await;
         self.sm_tx.set_enable(false);
+        PIO::uart_buffer()
+            .idle_line
+            .lock(|b| *b.borrow_mut() = true);
         self.sm_rx.set_enable(true);
     }
 
-    fn read_buffer(&'a self, buf: &'a mut [u8]) -> impl Future<Output = Result<usize, Error>> + 'a {
+    fn read_buffer<'c>(&'c self, buf: &'c mut [u8]) -> impl Future<Output = Result<usize, Error>> + 'c {
         poll_fn(move |cx| {
             if let Poll::Ready(r) = self.try_read(buf) {
                 return Poll::Ready(r);
@@ -240,10 +282,10 @@ impl<'a, PIO: Instance + UartPioAccess> HalfDuplexUart<'a, PIO> {
         }
         self.write_ring(buf);
         if !self.sm_tx.is_enabled() {
-            self.enable_sm_tx();
+            self.enable_sm_tx().await;
         }
         let result = self.write_fifo().await;
-        self.enable_sm_rx();
+        self.enable_sm_rx().await;
         result
     }
 
@@ -256,13 +298,26 @@ impl<'a, PIO: Instance + UartPioAccess> HalfDuplexUart<'a, PIO> {
 
     async fn write_fifo(&mut self) -> Result<usize, Error> {
         let mut reader = unsafe { PIO::uart_buffer().buf_tx.reader() };
-        let data = reader.pop_slice();
-        let n = data.len();
-        for &byte in data.iter() {
-            self.sm_tx.tx().wait_push(byte as u32).await;
+        let mut n = 0;
+        while let Some(byte) = reader.pop_one() {
+            self.wait_push(byte as u32).await;
+            n += 1;
         }
-        reader.pop_done(n);
         Ok(n)
+    }
+
+    fn wait_push<'b>(&'b mut self, byte: u32) -> impl Future<Output = ()> + 'b + use<'b, 'a, PIO> {
+        poll_fn(move |cx| {
+            if self.sm_tx.tx().try_push(byte) {
+                return Poll::Ready(());
+            }
+            PIO::regs()
+                .irqs(0)
+                .inte()
+                .modify(|i| i.set_sm0_txnfull(true));
+            PIO::uart_buffer().waker_tx.register(cx.waker());
+            Poll::Pending
+        })
     }
 
     async fn flush(&mut self) -> Result<(), Error> {
@@ -283,17 +338,17 @@ pub struct UartInterruptHandler<PIO: Instance + UartPioAccess> {
 
 impl<PIO: Instance + UartPioAccess> Handler<PIO::Interrupt> for UartInterruptHandler<PIO> {
     unsafe fn on_interrupt() {
-        const SM1_RX_BIT: u32 = 1 << 1;
         let pio = PIO::regs();
-        let irq = PIO::regs().irq().read().irq();
         let ints = PIO::regs().irqs(0).ints().read().0;
+
         if PIO::uart_buffer().buf_rx.is_available() {
-            if ints & SM1_RX_BIT != 0 {
+            if ints & STATUS_SM1_RX_BIT != 0 {
                 let mut writer = unsafe { PIO::uart_buffer().buf_rx.writer() };
                 let rx_buf = writer.push_slice();
                 if rx_buf.len() > 0 {
                     let mut n = 0;
-                    while (pio.fstat().read().rxempty() & SM1_RX_BIT as u8) == 0 && n < rx_buf.len()
+                    while (pio.fstat().read().rxempty() & STATUS_SM1_RX_BIT as u8) == 0
+                        && n < rx_buf.len()
                     {
                         let byte = pio.rxf(1).read();
                         rx_buf[n] = (byte >> 24) as u8;
@@ -303,11 +358,37 @@ impl<PIO: Instance + UartPioAccess> Handler<PIO::Interrupt> for UartInterruptHan
                     PIO::Interrupt::unpend();
                     PIO::uart_buffer().waker_rx.wake();
                 }
-            } else if irq & (1 << 0) == 1 {
-                // RX_SM Invalid Stop Bit Raised IRQ 0
-                pio.irq().write(|f| f.set_irq(1 << 0));
-                PIO::Interrupt::unpend();
             }
+        }
+        if ints & STATUS_SM0_TX_BIT != 0 {
+            // TX_SM FIFO Not Full
+            PIO::Interrupt::unpend();
+            PIO::regs()
+                .irqs(0)
+                .inte()
+                .modify(|i| i.set_sm0_txnfull(false));
+            PIO::uart_buffer().waker_tx.wake();
+        }
+        if ints & STATUS_SM_IRQ0_BIT != 0 {
+            // RX_SM Invalid Stop Bit Raised IRQ 0
+            pio.irq().write(|f| f.set_irq(IRQ_FLAG_0));
+            PIO::Interrupt::unpend();
+        }
+        if ints & STATUS_SM_IRQ1_BIT != 0 {
+            // Line Non-Idle Toogle Raised IRQ 1
+            PIO::uart_buffer()
+                .idle_line
+                .lock(|b| *b.borrow_mut() = false);
+            pio.irq().write(|f| f.set_irq(IRQ_FLAG_1));
+            PIO::Interrupt::unpend();
+        }
+        if ints & STATUS_SM_IRQ2_BIT != 0 {
+            // Line Idle Toogle Raised IRQ 2
+            PIO::uart_buffer()
+                .idle_line
+                .lock(|b| *b.borrow_mut() = true);
+            pio.irq().write(|f| f.set_irq(IRQ_FLAG_2));
+            PIO::Interrupt::unpend();
         }
     }
 }
