@@ -247,7 +247,10 @@ impl<'a, PIO: Instance + UartPioAccess> HalfDuplexUart<'a, PIO> {
         self.sm_rx.set_enable(true);
     }
 
-    fn read_buffer<'c>(&'c self, buf: &'c mut [u8]) -> impl Future<Output = Result<usize, Error>> + 'c {
+    fn read_buffer<'c>(
+        &'c self,
+        buf: &'c mut [u8],
+    ) -> impl Future<Output = Result<usize, Error>> + 'c {
         poll_fn(move |cx| {
             if let Poll::Ready(r) = self.try_read(buf) {
                 return Poll::Ready(r);
