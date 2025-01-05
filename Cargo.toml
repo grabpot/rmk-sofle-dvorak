@@ -9,7 +9,7 @@ edition = "2021"
 license = "MIT"
 
 [dependencies]
-rmk = { version = "0.4.1", features = [
+rmk = { git = "https://github.com/grabpot/rmk", branch = "fix/splitserial", features = [
     "async_matrix",
     "split",
     ] }
